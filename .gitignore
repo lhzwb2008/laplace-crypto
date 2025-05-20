@@ -1,0 +1,5 @@
+*.log
+*.csv
+*.png
+__pycache__
+output
