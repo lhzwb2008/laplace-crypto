@@ -12,26 +12,26 @@ import time as time_module
 CONFIG = {
     "data_file": None,  # 设置为None会自动查找最新的BTC数据文件
     "source": "okx",
-    "lookback_days": 2,  # 用于计算波动率的历史数据天数
-    "k1": 1.2,  # 上边界乘数
-    "k2": 1.2,  # 下边界乘数
-    "trade_start_time": time(0, 0),  # 比特币24小时交易，可以自定义交易时段
-    "trade_end_time": time(23, 59),
+    "lookback_days": 3,  # 用于计算波动率的历史数据天数
+    "k1": 1.5,  # 上边界乘数
+    "k2": 1.5,  # 下边界乘数
+    "trade_start_time": time(16, 0),  # 比特币24小时交易，可以自定义交易时段
+    "trade_end_time": time(23, 50),
     "max_trades_per_day": 3,  # 每日最大交易次数
     "commission_rate": 0.0005,  # 手续费率（0.05%）
     "slippage": 0.0003,  # 滑点（0.03%）
     "start_date": "2025-05-10",  # 只处理从这个日期开始的数据
     "initial_balance": 100000,  # 初始资金金额
-    "stop_loss_check_interval": 10  # 止损检查间隔（分钟）
+    "check_interval": 10  # 检查间隔（分钟），同时应用于入场和止损检查
 }
 
-class NoiseRegionStrategy:
+class NoiseRegionStrategyFixed:
     def __init__(self, data, lookback_days=2, k1=1.2, k2=1.2, 
                  trade_start_time=time(9, 30), trade_end_time=time(15, 30),
                  max_trades_per_day=3, commission_rate=0.0005, slippage=0.0003,
-                 initial_balance=100000, stop_loss_check_interval=10):
+                 initial_balance=100000, check_interval=10):
         """
-        噪声区域交易策略初始化
+        噪声区域交易策略初始化 - 固定时间间隔检查版本
         
         参数:
         data: DataFrame - 包含时间戳、开盘价、最高价、最低价、收盘价的数据
@@ -44,7 +44,7 @@ class NoiseRegionStrategy:
         commission_rate: float - 交易手续费率（单边）
         slippage: float - 滑点率
         initial_balance: float - 初始资金金额
-        stop_loss_check_interval: int - 止损检查间隔（分钟）
+        check_interval: int - 检查间隔（分钟），同时应用于入场和止损检查
         """
         # 数据预处理
         self.data = data.copy()
@@ -60,7 +60,7 @@ class NoiseRegionStrategy:
         self.max_trades_per_day = max_trades_per_day
         self.commission_rate = commission_rate
         self.slippage = slippage
-        self.stop_loss_check_interval = stop_loss_check_interval
+        self.check_interval = check_interval
         
         # 资金管理
         self.initial_balance = initial_balance
@@ -74,6 +74,28 @@ class NoiseRegionStrategy:
         self.results = None
         self.performance = None
         self.bounds = None
+        
+        # 添加标志，标记数据点是否为检查点
+        self._mark_check_points()
+        
+    def _mark_check_points(self):
+        """标记所有的检查点（符合时间间隔的点）"""
+        self.data['is_check_point'] = False
+        
+        # 按日期分组处理
+        for date, group in self.data.groupby('date'):
+            # 计算每个时间点的总分钟数
+            minutes_times = [(t.hour * 60 + t.minute) for t in group['time']]
+            
+            # 找出所有符合检查间隔的时间点
+            check_indices = [i for i, m in enumerate(minutes_times) if m % self.check_interval == 0]
+            
+            # 标记这些检查点
+            if check_indices:
+                date_indices = group.index[check_indices]
+                self.data.loc[date_indices, 'is_check_point'] = True
+        
+        print(f"已标记 {self.data['is_check_point'].sum()} 个检查点，总数据点数 {len(self.data)}")
         
     def calculate_bounds(self):
         """计算每个时间点的上下边界"""
@@ -232,9 +254,9 @@ class NoiseRegionStrategy:
             print(f"警告: sigma计算耗时 {elapsed_time:.2f} 秒")
             
         return result
-    
+        
     def run_backtest(self):
-        """运行回测"""
+        """运行回测 - 只在固定时间间隔检查点进行决策"""
         if self.bounds is None:
             self.calculate_bounds()
         
@@ -256,7 +278,22 @@ class NoiseRegionStrategy:
         pnl = 0  # 当前交易盈亏
         trade_count = 0  # 总交易次数计数
         position_size = 0  # 持仓数量
-        last_stop_loss_check_time = None  # 上次止损检查时间
+        last_check_time = None  # 上次检查时间
+        
+        # 添加is_check_point列到回测结果
+        backtest_results['is_check_point'] = False
+        for index, row in backtest_results.iterrows():
+            # 计算当前分钟数
+            current_time = row['time']
+            current_minutes = current_time.hour * 60 + current_time.minute
+            
+            # 检查是否是检查点
+            if current_minutes % self.check_interval == 0:
+                backtest_results.at[index, 'is_check_point'] = True
+        
+        # 打印检查点数量
+        check_points_count = backtest_results['is_check_point'].sum()
+        print(f"回测中共有 {check_points_count} 个检查点，总数据点 {len(backtest_results)}")
         
         # 逐行处理数据
         for i in range(len(backtest_results)):
@@ -266,7 +303,7 @@ class NoiseRegionStrategy:
             if current_date != row['date']:
                 current_date = row['date']
                 trades_today = 0
-                last_stop_loss_check_time = None  # 新交易日重置止损检查时间
+                last_check_time = None  # 新交易日重置检查时间
                 
             backtest_results.at[i, 'trades_today'] = trades_today
             
@@ -274,7 +311,7 @@ class NoiseRegionStrategy:
             current_time = row['time']
             in_trading_hours = (self.trade_start_time <= current_time <= self.trade_end_time)
             
-            # 更新止损价格
+            # 更新止损价格 (这里可以每分钟都更新，因为只是计算不是执行)
             if not np.isnan(stop_loss):
                 if position == 1:  # 多头追踪止损
                     stop_loss = max(stop_loss, row['upper_bound'])
@@ -282,23 +319,16 @@ class NoiseRegionStrategy:
                     stop_loss = min(stop_loss, row['lower_bound'])
                 backtest_results.at[i, 'stop_loss'] = stop_loss
             
-            # 平仓条件检查
-            if position != 0:
-                # 创建当前时间的datetime对象
-                current_datetime = datetime.combine(row['date'], current_time)
-                
-                # 确定是否需要检查止损
-                # 第一次交易后的检查或者间隔符合条件的检查
-                check_stop_loss = False
-                if last_stop_loss_check_time is None:
-                    check_stop_loss = True
-                elif (current_datetime - last_stop_loss_check_time).total_seconds() >= (self.stop_loss_check_interval * 60):
-                    check_stop_loss = True
-                
+            # 创建当前时间的datetime对象
+            current_datetime = datetime.combine(row['date'], current_time)
+            
+            # 确定是否是检查点
+            is_check_point = row['is_check_point']
+            
+            # 平仓条件检查（只在检查点进行）
+            if position != 0 and is_check_point and in_trading_hours:
                 # 止损触发检查
-                if check_stop_loss and ((position == 1 and row['close'] < stop_loss) or (position == -1 and row['close'] > stop_loss)):
-                    # 更新最后止损检查时间
-                    last_stop_loss_check_time = current_datetime
+                if (position == 1 and row['close'] < stop_loss) or (position == -1 and row['close'] > stop_loss):
                     # 计算盈亏（考虑滑点和手续费）
                     exit_price = row['close'] * (1 - position * self.slippage)
                     
@@ -347,60 +377,60 @@ class NoiseRegionStrategy:
                     
                     if trade_count % 50 == 0:
                         print(f"已处理 {trade_count} 笔交易...")
-                
-                # 交易时段结束强制平仓
-                elif current_time >= self.trade_end_time and position != 0:
-                    # 计算盈亏
-                    exit_price = row['close'] * (1 - position * self.slippage)
-                    
-                    # 计算交易总值和手续费
-                    trade_value = position_size * exit_price
-                    exit_fee = trade_value * self.commission_rate
-                    
-                    # 更新资金余额
-                    if position == 1:  # 多头平仓
-                        self.current_balance = trade_value - exit_fee
-                    else:  # 空头平仓
-                        profit_ratio = (entry_price - exit_price) / entry_price  # 空头收益率
-                        self.current_balance = self.current_balance * (1 + profit_ratio) - exit_fee
-                        
-                    pnl = self.current_balance - self.balance_history[-1] if self.balance_history else self.current_balance - self.initial_balance
-                    self.balance_history.append(self.current_balance)
-                    
-                    # 记录交易
-                    self.trades.append({
-                        'entry_date': entry_date,
-                        'entry_time': entry_time,
-                        'entry_price': entry_price,
-                        'exit_date': row['date'],
-                        'exit_time': row['time'],
-                        'exit_price': exit_price,
-                        'position': position,
-                        'position_size': position_size,
-                        'pnl': pnl,
-                        'balance': self.current_balance,
-                        'exit_reason': 'session_end'
-                    })
-                    
-                    # 更新信号和持仓
-                    signal = 2 if position == 1 else -2
-                    backtest_results.at[i, 'signal'] = signal
-                    backtest_results.at[i, 'balance'] = self.current_balance
-                    
-                    print(f"收盘平仓: 价格={exit_price:.2f}, 数量={position_size:.6f}, 盈亏={pnl:.2f}, 余额={self.current_balance:.2f}")
-                    
-                    position = 0
-                    position_size = 0
-                    stop_loss = np.nan
-                    trades_today += 1
-                    trade_count += 1
-                    backtest_results.at[i, 'trades_today'] = trades_today
-                    
-                    if trade_count % 50 == 0:
-                        print(f"已处理 {trade_count} 笔交易...")
             
-            # 开仓条件检查（仅当空仓且在交易时段内且当日交易次数未达上限）
-            if position == 0 and in_trading_hours and trades_today < self.max_trades_per_day:
+            # 交易时段结束强制平仓
+            if current_time >= self.trade_end_time and position != 0:
+                # 计算盈亏
+                exit_price = row['close'] * (1 - position * self.slippage)
+                
+                # 计算交易总值和手续费
+                trade_value = position_size * exit_price
+                exit_fee = trade_value * self.commission_rate
+                
+                # 更新资金余额
+                if position == 1:  # 多头平仓
+                    self.current_balance = trade_value - exit_fee
+                else:  # 空头平仓
+                    profit_ratio = (entry_price - exit_price) / entry_price  # 空头收益率
+                    self.current_balance = self.current_balance * (1 + profit_ratio) - exit_fee
+                    
+                pnl = self.current_balance - self.balance_history[-1] if self.balance_history else self.current_balance - self.initial_balance
+                self.balance_history.append(self.current_balance)
+                
+                # 记录交易
+                self.trades.append({
+                    'entry_date': entry_date,
+                    'entry_time': entry_time,
+                    'entry_price': entry_price,
+                    'exit_date': row['date'],
+                    'exit_time': row['time'],
+                    'exit_price': exit_price,
+                    'position': position,
+                    'position_size': position_size,
+                    'pnl': pnl,
+                    'balance': self.current_balance,
+                    'exit_reason': 'session_end'
+                })
+                
+                # 更新信号和持仓
+                signal = 2 if position == 1 else -2
+                backtest_results.at[i, 'signal'] = signal
+                backtest_results.at[i, 'balance'] = self.current_balance
+                
+                print(f"收盘平仓: 价格={exit_price:.2f}, 数量={position_size:.6f}, 盈亏={pnl:.2f}, 余额={self.current_balance:.2f}")
+                
+                position = 0
+                position_size = 0
+                stop_loss = np.nan
+                trades_today += 1
+                trade_count += 1
+                backtest_results.at[i, 'trades_today'] = trades_today
+                
+                if trade_count % 50 == 0:
+                    print(f"已处理 {trade_count} 笔交易...")
+            
+            # 开仓条件检查（仅当空仓且在交易时段内且当日交易次数未达上限且是检查点）
+            if position == 0 and in_trading_hours and trades_today < self.max_trades_per_day and is_check_point:
                 # 多头入场: 价格 > 上边界
                 if row['close'] > row['upper_bound']:
                     position = 1
@@ -417,9 +447,6 @@ class NoiseRegionStrategy:
                     trades_today += 1
                     trade_count += 1
                     backtest_results.at[i, 'trades_today'] = trades_today
-                    
-                    # 设置最后止损检查时间为当前入场时间
-                    last_stop_loss_check_time = datetime.combine(entry_date, entry_time)
                     
                     # 记录交易开始信息
                     print(f"多头入场: 价格={entry_price:.2f}, 数量={position_size:.6f}, 余额={self.current_balance:.2f}")
@@ -443,9 +470,6 @@ class NoiseRegionStrategy:
                     trades_today += 1
                     trade_count += 1
                     backtest_results.at[i, 'trades_today'] = trades_today
-                    
-                    # 设置最后止损检查时间为当前入场时间
-                    last_stop_loss_check_time = datetime.combine(entry_date, entry_time)
                     
                     # 记录交易开始信息
                     print(f"空头入场: 价格={entry_price:.2f}, 数量={position_size:.6f}, 余额={self.current_balance:.2f}")
@@ -539,7 +563,7 @@ class NoiseRegionStrategy:
         
         return self.performance
     
-    def plot_results(self, output_dir='./output', filename='noise_region_backtest.png'):
+    def plot_results(self, output_dir='./output', filename='noise_region_fixed_backtest.png'):
         """绘制回测结果图表"""
         if self.results is None:
             print("请先运行回测")
@@ -560,7 +584,7 @@ class NoiseRegionStrategy:
         day_data = self.results[self.results['date'] == sample_date].copy()
         
         # 创建画布
-        fig, axs = plt.subplots(2, 1, figsize=(15, 10), gridspec_kw={'height_ratios': [3, 1]})
+        fig, axs = plt.subplots(3, 1, figsize=(15, 12), gridspec_kw={'height_ratios': [3, 1, 1]})
         
         # 绘制价格和边界
         axs[0].plot(day_data['timestamp'], day_data['close'], label='Close Price', color='black')
@@ -569,6 +593,10 @@ class NoiseRegionStrategy:
         
         if 'stop_loss' in day_data.columns:
             axs[0].plot(day_data['timestamp'], day_data['stop_loss'], label='Stop Loss', color='purple', linestyle=':')
+        
+        # 标记检查点
+        check_points = day_data[day_data['is_check_point']]
+        axs[0].scatter(check_points['timestamp'], check_points['close'], color='yellow', marker='o', s=30, label='Check Point')
         
         # 标记交易信号
         buy_signals = day_data[day_data['signal'] == 1]
@@ -581,18 +609,25 @@ class NoiseRegionStrategy:
         axs[0].scatter(close_long['timestamp'], close_long['close'], color='blue', marker='x', s=100, label='Close Long')
         axs[0].scatter(close_short['timestamp'], close_short['close'], color='orange', marker='x', s=100, label='Close Short')
         
-        axs[0].set_title(f'Noise Region Strategy - {sample_date}')
+        axs[0].set_title(f'Noise Region Strategy - Fixed Interval - {sample_date}')
         axs[0].set_ylabel('Price')
         axs[0].legend()
         axs[0].grid(True)
         
         # 绘制持仓状态
         axs[1].plot(day_data['timestamp'], day_data['position'], label='Position', color='blue', drawstyle='steps-post')
-        axs[1].set_xlabel('Time')
         axs[1].set_ylabel('Position')
         axs[1].set_yticks([-1, 0, 1])
         axs[1].set_yticklabels(['Short', 'Flat', 'Long'])
         axs[1].grid(True)
+        
+        # 绘制检查点标记
+        axs[2].step(day_data['timestamp'], day_data['is_check_point'].astype(int), where='post', color='orange', label='Check Points')
+        axs[2].set_xlabel('Time')
+        axs[2].set_ylabel('Check Point')
+        axs[2].set_yticks([0, 1])
+        axs[2].set_yticklabels(['No', 'Yes'])
+        axs[2].grid(True)
         
         plt.tight_layout()
         plt.savefig(os.path.join(output_dir, filename))
@@ -613,7 +648,7 @@ class NoiseRegionStrategy:
             plt.xlabel('Trade #')
             plt.ylabel('PnL')
             plt.grid(True)
-            plt.savefig(os.path.join(output_dir, 'cumulative_pnl.png'))
+            plt.savefig(os.path.join(output_dir, 'fixed_cumulative_pnl.png'))
             plt.close()
             
             # 绘制资金曲线
@@ -640,7 +675,7 @@ class NoiseRegionStrategy:
                              'r--', linewidth=2, label=f'Max Drawdown: {drawdown.iloc[max_dd_idx]*100:.2f}%')
                 
                 plt.legend()
-                plt.savefig(os.path.join(output_dir, 'balance_history.png'))
+                plt.savefig(os.path.join(output_dir, 'fixed_balance_history.png'))
                 plt.close()
     
     def save_results(self, output_dir='./output'):
@@ -654,18 +689,18 @@ class NoiseRegionStrategy:
         
         # 保存回测结果
         print("保存回测结果...")
-        self.results.to_csv(os.path.join(output_dir, 'backtest_results.csv'), index=False)
+        self.results.to_csv(os.path.join(output_dir, 'fixed_backtest_results.csv'), index=False)
         
         # 保存交易记录
         if self.trades:
             print("保存交易记录...")
             trades_df = pd.DataFrame(self.trades)
-            trades_df.to_csv(os.path.join(output_dir, 'trades.csv'), index=False)
+            trades_df.to_csv(os.path.join(output_dir, 'fixed_trades.csv'), index=False)
         
         # 保存性能指标
         if self.performance:
             print("保存性能指标...")
-            pd.DataFrame([self.performance]).to_csv(os.path.join(output_dir, 'performance.csv'), index=False)
+            pd.DataFrame([self.performance]).to_csv(os.path.join(output_dir, 'fixed_performance.csv'), index=False)
             
         print(f"回测结果已保存到 {output_dir} 目录")
 
@@ -742,7 +777,7 @@ def main():
         return
     
     # 初始化策略
-    strategy = NoiseRegionStrategy(
+    strategy = NoiseRegionStrategyFixed(
         data=data,
         lookback_days=CONFIG["lookback_days"],
         k1=CONFIG["k1"],
@@ -753,7 +788,7 @@ def main():
         commission_rate=CONFIG["commission_rate"],
         slippage=CONFIG["slippage"],
         initial_balance=CONFIG["initial_balance"],
-        stop_loss_check_interval=CONFIG["stop_loss_check_interval"]
+        check_interval=CONFIG["check_interval"]
     )
     
     # 运行回测
@@ -771,4 +806,4 @@ def main():
     strategy.save_results()
 
 if __name__ == "__main__":
-    main()
+    main()   
