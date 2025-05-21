@@ -13,23 +13,21 @@ CONFIG = {
     "data_file": None,  # 设置为None会自动查找最新的BTC数据文件
     "source": "okx",
     "lookback_days": 3,  # 用于计算波动率的历史数据天数
-    "k1": 1.5,  # 上边界乘数
-    "k2": 1.5,  # 下边界乘数
-    "trade_start_time": time(16, 0),  # 比特币24小时交易，可以自定义交易时段
-    "trade_end_time": time(23, 50),
+    "k1": 1,  # 上边界乘数
+    "k2": 1,  # 下边界乘数
     "max_trades_per_day": 3,  # 每日最大交易次数
-    "commission_rate": 0.0005,  # 手续费率（0.05%）
-    "slippage": 0.0003,  # 滑点（0.03%）
+    "commission_rate": 0,  # 手续费率（0.05%）
+    "slippage": 0,  # 滑点（0.03%）
     "start_date": "2025-05-10",  # 只处理从这个日期开始的数据
     "initial_balance": 100000,  # 初始资金金额
-    "check_interval": 10  # 检查间隔（分钟），同时应用于入场和止损检查
+    "check_interval": 10,  # 检查间隔（分钟），应用于入场、止损和超时检查
+    "max_holding_minutes": 120  # 最大持仓时间（分钟）
 }
 
 class NoiseRegionStrategyFixed:
     def __init__(self, data, lookback_days=2, k1=1.2, k2=1.2, 
-                 trade_start_time=time(9, 30), trade_end_time=time(15, 30),
                  max_trades_per_day=3, commission_rate=0.0005, slippage=0.0003,
-                 initial_balance=100000, check_interval=10):
+                 initial_balance=100000, check_interval=10, max_holding_minutes=120):
         """
         噪声区域交易策略初始化 - 固定时间间隔检查版本
         
@@ -38,13 +36,12 @@ class NoiseRegionStrategyFixed:
         lookback_days: int - 用于计算波动率的历史数据天数
         k1: float - 上边界乘数，调整上边界sigma的影响力
         k2: float - 下边界乘数，调整下边界sigma的影响力
-        trade_start_time: time - 交易开始时间
-        trade_end_time: time - 交易结束时间
         max_trades_per_day: int - 每日最大交易次数限制
         commission_rate: float - 交易手续费率（单边）
         slippage: float - 滑点率
         initial_balance: float - 初始资金金额
-        check_interval: int - 检查间隔（分钟），同时应用于入场和止损检查
+        check_interval: int - 检查间隔（分钟），应用于入场、止损和超时检查
+        max_holding_minutes: int - 最大持仓时间（分钟）
         """
         # 数据预处理
         self.data = data.copy()
@@ -55,12 +52,11 @@ class NoiseRegionStrategyFixed:
         self.lookback_days = lookback_days
         self.k1 = k1
         self.k2 = k2
-        self.trade_start_time = trade_start_time
-        self.trade_end_time = trade_end_time
         self.max_trades_per_day = max_trades_per_day
         self.commission_rate = commission_rate
         self.slippage = slippage
         self.check_interval = check_interval
+        self.max_holding_minutes = max_holding_minutes
         
         # 资金管理
         self.initial_balance = initial_balance
@@ -95,89 +91,55 @@ class NoiseRegionStrategyFixed:
                 date_indices = group.index[check_indices]
                 self.data.loc[date_indices, 'is_check_point'] = True
         
-        print(f"已标记 {self.data['is_check_point'].sum()} 个检查点，总数据点数 {len(self.data)}")
+        print(f"已标记 {self.data['is_check_point'].sum()} 个检查点，总数据点 {len(self.data)}")
         
     def calculate_bounds(self):
-        """计算每个时间点的上下边界"""
+        """计算每个时间点的上下边界 - 直接使用昨日价格范围的1/4和3/4价位"""
         # 为每一行数据添加上下边界
         bounds_data = []
         
         # 获取所有唯一日期
         unique_dates = sorted(self.data['date'].unique())
-        total_dates = len(unique_dates) - self.lookback_days
+        total_dates = len(unique_dates) - 1  # 需要至少有前一天的数据
         
         print(f"开始计算边界，总计 {total_dates} 个交易日...")
         
         # 对每个交易日计算边界
         for i, current_date in enumerate(unique_dates):
-            if i < self.lookback_days:
+            if i == 0:  # 跳过第一天，因为没有前一天的数据
                 continue
                 
-            if (i - self.lookback_days) % 10 == 0 or (i - self.lookback_days) == total_dates - 1:
-                progress = (i - self.lookback_days + 1) / total_dates * 100
+            if (i - 1) % 10 == 0 or (i - 1) == total_dates - 1:
+                progress = i / total_dates * 100
                 print(f"处理日期: {current_date} ({progress:.1f}%)")
                 
             # 获取当日数据
             current_day_data = self.data[self.data['date'] == current_date].copy()
             
-            # 获取当日开盘价
-            day_open = current_day_data.iloc[0]['open']
-            
-            # 获取前一日收盘价
+            # 获取前一日数据
             prev_date = unique_dates[i-1]
             prev_day_data = self.data[self.data['date'] == prev_date]
-            prev_close = prev_day_data.iloc[-1]['close']
             
-            # 确定上下边界参考价
-            upper_ref = max(day_open, prev_close)
-            lower_ref = min(day_open, prev_close)
+            # 计算前一日的价格范围
+            prev_high = prev_day_data['high'].max()
+            prev_low = prev_day_data['low'].min()
+            prev_range = prev_high - prev_low
             
-            # 预先计算该日不同时间点的sigma，避免重复计算
-            unique_times = current_day_data['time'].unique()
-            time_count = len(unique_times)
-            print(f"当日 {current_date} 有 {time_count} 个不同时间点需要计算sigma")
+            # 计算固定的上下边界（1/4和3/4价位）
+            lower_bound = prev_low + prev_range * 0.25  # 1/4价位
+            upper_bound = prev_low + prev_range * 0.75  # 3/4价位
             
-            start_overall = time_module.time()
-            batch_size = 100  # 批量处理大小
-            time_sigma = {}
-            
-            # 批量处理时间点，每批次打印一次进度
-            for batch_idx in range(0, time_count, batch_size):
-                batch_end = min(batch_idx + batch_size, time_count)
-                batch_times = unique_times[batch_idx:batch_end]
-                
-                # 批量计算这些时间点的sigma
-                for time_val in batch_times:
-                    time_sigma[time_val] = self._calculate_sigma(unique_dates[:i], time_val, day_open)
-                
-                # 打印进度
-                elapsed = time_module.time() - start_overall
-                print(f"已处理 {batch_end}/{time_count} 个时间点 (耗时: {elapsed:.2f}秒)")
-                
-                # 每批次强制执行垃圾回收，减少内存占用
-                import gc
-                gc.collect()
-            
-            # 为当日每个时间点计算边界
+            # 为当日每个时间点设置相同的边界
             for _, row in current_day_data.iterrows():
-                current_time = row['time']
-                
-                # 从预计算的值获取sigma
-                sigma = time_sigma[current_time]
-                
-                # 计算上下边界
-                upper_bound = upper_ref * (1 + self.k1 * sigma)
-                lower_bound = lower_ref * (1 - self.k2 * sigma)
-                
                 # 添加到结果中
                 bounds_row = row.copy()
                 bounds_row['upper_bound'] = upper_bound
                 bounds_row['lower_bound'] = lower_bound
-                bounds_row['sigma'] = sigma
-                bounds_row['day_open'] = day_open
-                bounds_row['prev_close'] = prev_close
-                bounds_row['upper_ref'] = upper_ref
-                bounds_row['lower_ref'] = lower_ref
+                bounds_row['prev_high'] = prev_high
+                bounds_row['prev_low'] = prev_low
+                bounds_row['prev_range'] = prev_range
+                bounds_row['quarter_position'] = 0.25  # 记录使用了1/4位置
+                bounds_row['three_quarter_position'] = 0.75  # 记录使用了3/4位置
                 
                 bounds_data.append(bounds_row)
         
@@ -185,8 +147,8 @@ class NoiseRegionStrategyFixed:
         print("边界计算完成，正在处理数据...")
         self.bounds = pd.DataFrame(bounds_data)
         return self.bounds
-    
-    def _calculate_sigma(self, historical_dates, current_time, current_day_open):
+        
+    def _calculate_sigma(self, historical_dates, current_time, reference_price):
         """计算特定时间点的历史波动率sigma"""
         # 使用缓存来提高性能
         cache_key = f"{hash(tuple(historical_dates))}-{current_time}"
@@ -212,30 +174,35 @@ class NoiseRegionStrategyFixed:
             print(f"调试: 历史日期数: {len(recent_dates)}, 过滤后数据量: {len(filtered_data)}")
             print(f"调试: 历史日期: {recent_dates}")
             print(f"调试: 当前时间点: {current_time}")
-            
-        # 创建开盘价缓存
-        if not hasattr(self, '_open_price_cache'):
-            self._open_price_cache = {}
-            
-        # 按日期分组处理
-        for hist_date, group in filtered_data.groupby('date'):
-            # 从开盘价缓存获取开盘价，避免每次重新筛选数据
-            if hist_date in self._open_price_cache:
-                hist_day_open = self._open_price_cache[hist_date]
-            else:
-                # 获取当日开盘数据
-                day_data = self.data[self.data['date'] == hist_date]
+        
+        # 为每个历史日期计算其价格范围的1/4和3/4价位
+        for hist_date_idx, hist_date in enumerate(recent_dates):
+            if hist_date_idx == 0:  # 跳过第一天，因为需要前一天的数据
+                continue
                 
-                if len(day_data) == 0:
-                    continue
-                    
-                hist_day_open = day_data.iloc[0]['open']
-                self._open_price_cache[hist_date] = hist_day_open
+            # 获取当日和前一日数据
+            hist_day_data = self.data[self.data['date'] == hist_date]
+            prev_hist_date = recent_dates[hist_date_idx - 1]
+            prev_hist_day_data = self.data[self.data['date'] == prev_hist_date]
             
-            if len(group) > 0:
-                # 计算相对于开盘价的绝对变动率
-                close_price = group.iloc[0]['close']
-                change_rate = abs(close_price / hist_day_open - 1)
+            if len(hist_day_data) == 0 or len(prev_hist_day_data) == 0:
+                continue
+            
+            # 计算前一日价格范围
+            prev_high = prev_hist_day_data['high'].max()
+            prev_low = prev_hist_day_data['low'].min()
+            prev_range = prev_high - prev_low
+            
+            # 计算参考价位（1/4和3/4）
+            hist_lower_ref = prev_low + prev_range * 0.25
+            
+            # 查找特定时间点的数据
+            time_data = hist_day_data[hist_day_data['time'] == current_time]
+            
+            if len(time_data) > 0:
+                # 计算相对于参考价格的绝对变动率
+                close_price = time_data.iloc[0]['close']
+                change_rate = abs(close_price / hist_lower_ref - 1)
                 historical_changes.append(change_rate)
         
         # 计算平均变动率作为sigma
@@ -278,7 +245,7 @@ class NoiseRegionStrategyFixed:
         pnl = 0  # 当前交易盈亏
         trade_count = 0  # 总交易次数计数
         position_size = 0  # 持仓数量
-        last_check_time = None  # 上次检查时间
+        entry_datetime = None  # 入场时间（完整的datetime对象）
         
         # 添加is_check_point列到回测结果
         backtest_results['is_check_point'] = False
@@ -303,13 +270,8 @@ class NoiseRegionStrategyFixed:
             if current_date != row['date']:
                 current_date = row['date']
                 trades_today = 0
-                last_check_time = None  # 新交易日重置检查时间
                 
             backtest_results.at[i, 'trades_today'] = trades_today
-            
-            # 检查是否在交易时段内
-            current_time = row['time']
-            in_trading_hours = (self.trade_start_time <= current_time <= self.trade_end_time)
             
             # 更新止损价格 (这里可以每分钟都更新，因为只是计算不是执行)
             if not np.isnan(stop_loss):
@@ -320,14 +282,14 @@ class NoiseRegionStrategyFixed:
                 backtest_results.at[i, 'stop_loss'] = stop_loss
             
             # 创建当前时间的datetime对象
-            current_datetime = datetime.combine(row['date'], current_time)
+            current_datetime = datetime.combine(row['date'], row['time'])
             
             # 确定是否是检查点
             is_check_point = row['is_check_point']
             
             # 平仓条件检查（只在检查点进行）
-            if position != 0 and is_check_point and in_trading_hours:
-                # 止损触发检查
+            if position != 0 and is_check_point:
+                # 1. 止损触发检查
                 if (position == 1 and row['close'] < stop_loss) or (position == -1 and row['close'] > stop_loss):
                     # 计算盈亏（考虑滑点和手续费）
                     exit_price = row['close'] * (1 - position * self.slippage)
@@ -366,71 +328,78 @@ class NoiseRegionStrategyFixed:
                     backtest_results.at[i, 'signal'] = signal
                     backtest_results.at[i, 'balance'] = self.current_balance
                     
-                    print(f"止损平仓: 价格={exit_price:.2f}, 数量={position_size:.6f}, 盈亏={pnl:.2f}, 余额={self.current_balance:.2f}")
+                    print(f"止损平仓: 日期={row['date']}, 时间={row['time']}, 价格={exit_price:.2f}, 数量={position_size:.6f}, 盈亏={pnl:.2f}, 余额={self.current_balance:.2f}")
                     
                     position = 0
                     position_size = 0
                     stop_loss = np.nan
+                    entry_datetime = None
                     trades_today += 1
                     trade_count += 1
                     backtest_results.at[i, 'trades_today'] = trades_today
                     
                     if trade_count % 50 == 0:
                         print(f"已处理 {trade_count} 笔交易...")
-            
-            # 交易时段结束强制平仓
-            if current_time >= self.trade_end_time and position != 0:
-                # 计算盈亏
-                exit_price = row['close'] * (1 - position * self.slippage)
                 
-                # 计算交易总值和手续费
-                trade_value = position_size * exit_price
-                exit_fee = trade_value * self.commission_rate
-                
-                # 更新资金余额
-                if position == 1:  # 多头平仓
-                    self.current_balance = trade_value - exit_fee
-                else:  # 空头平仓
-                    profit_ratio = (entry_price - exit_price) / entry_price  # 空头收益率
-                    self.current_balance = self.current_balance * (1 + profit_ratio) - exit_fee
+                # 2. 持仓时间超时检查
+                elif entry_datetime is not None:
+                    # 计算持仓时间（分钟）
+                    holding_minutes = (current_datetime - entry_datetime).total_seconds() / 60
                     
-                pnl = self.current_balance - self.balance_history[-1] if self.balance_history else self.current_balance - self.initial_balance
-                self.balance_history.append(self.current_balance)
-                
-                # 记录交易
-                self.trades.append({
-                    'entry_date': entry_date,
-                    'entry_time': entry_time,
-                    'entry_price': entry_price,
-                    'exit_date': row['date'],
-                    'exit_time': row['time'],
-                    'exit_price': exit_price,
-                    'position': position,
-                    'position_size': position_size,
-                    'pnl': pnl,
-                    'balance': self.current_balance,
-                    'exit_reason': 'session_end'
-                })
-                
-                # 更新信号和持仓
-                signal = 2 if position == 1 else -2
-                backtest_results.at[i, 'signal'] = signal
-                backtest_results.at[i, 'balance'] = self.current_balance
-                
-                print(f"收盘平仓: 价格={exit_price:.2f}, 数量={position_size:.6f}, 盈亏={pnl:.2f}, 余额={self.current_balance:.2f}")
-                
-                position = 0
-                position_size = 0
-                stop_loss = np.nan
-                trades_today += 1
-                trade_count += 1
-                backtest_results.at[i, 'trades_today'] = trades_today
-                
-                if trade_count % 50 == 0:
-                    print(f"已处理 {trade_count} 笔交易...")
+                    if holding_minutes >= self.max_holding_minutes:
+                        # 计算盈亏
+                        exit_price = row['close'] * (1 - position * self.slippage)
+                        
+                        # 计算交易总值和手续费
+                        trade_value = position_size * exit_price
+                        exit_fee = trade_value * self.commission_rate
+                        
+                        # 更新资金余额
+                        if position == 1:  # 多头平仓
+                            self.current_balance = trade_value - exit_fee
+                        else:  # 空头平仓
+                            profit_ratio = (entry_price - exit_price) / entry_price  # 空头收益率
+                            self.current_balance = self.current_balance * (1 + profit_ratio) - exit_fee
+                            
+                        pnl = self.current_balance - self.balance_history[-1] if self.balance_history else self.current_balance - self.initial_balance
+                        self.balance_history.append(self.current_balance)
+                        
+                        # 记录交易
+                        self.trades.append({
+                            'entry_date': entry_date,
+                            'entry_time': entry_time,
+                            'entry_price': entry_price,
+                            'exit_date': row['date'],
+                            'exit_time': row['time'],
+                            'exit_price': exit_price,
+                            'position': position,
+                            'position_size': position_size,
+                            'pnl': pnl,
+                            'balance': self.current_balance,
+                            'exit_reason': 'timeout',
+                            'holding_minutes': holding_minutes
+                        })
+                        
+                        # 更新信号和持仓
+                        signal = 2 if position == 1 else -2
+                        backtest_results.at[i, 'signal'] = signal
+                        backtest_results.at[i, 'balance'] = self.current_balance
+                        
+                        print(f"超时平仓: 日期={row['date']}, 时间={row['time']}, 持仓时间={holding_minutes:.1f}分钟, 价格={exit_price:.2f}, 数量={position_size:.6f}, 盈亏={pnl:.2f}, 余额={self.current_balance:.2f}")
+                        
+                        position = 0
+                        position_size = 0
+                        stop_loss = np.nan
+                        entry_datetime = None
+                        trades_today += 1
+                        trade_count += 1
+                        backtest_results.at[i, 'trades_today'] = trades_today
+                        
+                        if trade_count % 50 == 0:
+                            print(f"已处理 {trade_count} 笔交易...")
             
-            # 开仓条件检查（仅当空仓且在交易时段内且当日交易次数未达上限且是检查点）
-            if position == 0 and in_trading_hours and trades_today < self.max_trades_per_day and is_check_point:
+            # 开仓条件检查（仅当空仓且当日交易次数未达上限且是检查点）
+            if position == 0 and trades_today < self.max_trades_per_day and is_check_point:
                 # 多头入场: 价格 > 上边界
                 if row['close'] > row['upper_bound']:
                     position = 1
@@ -442,6 +411,7 @@ class NoiseRegionStrategyFixed:
                     stop_loss = row['upper_bound']
                     entry_date = row['date']
                     entry_time = row['time']
+                    entry_datetime = current_datetime  # 记录完整的入场时间
                     backtest_results.at[i, 'signal'] = 1
                     backtest_results.at[i, 'stop_loss'] = stop_loss
                     trades_today += 1
@@ -449,7 +419,7 @@ class NoiseRegionStrategyFixed:
                     backtest_results.at[i, 'trades_today'] = trades_today
                     
                     # 记录交易开始信息
-                    print(f"多头入场: 价格={entry_price:.2f}, 数量={position_size:.6f}, 余额={self.current_balance:.2f}")
+                    print(f"多头入场: 日期={entry_date}, 时间={entry_time}, 价格={entry_price:.2f}, 数量={position_size:.6f}, 余额={self.current_balance:.2f}")
                     
                     if trade_count % 50 == 0:
                         print(f"已处理 {trade_count} 笔交易...")
@@ -465,6 +435,7 @@ class NoiseRegionStrategyFixed:
                     stop_loss = row['lower_bound']
                     entry_date = row['date']
                     entry_time = row['time']
+                    entry_datetime = current_datetime  # 记录完整的入场时间
                     backtest_results.at[i, 'signal'] = -1
                     backtest_results.at[i, 'stop_loss'] = stop_loss
                     trades_today += 1
@@ -472,7 +443,7 @@ class NoiseRegionStrategyFixed:
                     backtest_results.at[i, 'trades_today'] = trades_today
                     
                     # 记录交易开始信息
-                    print(f"空头入场: 价格={entry_price:.2f}, 数量={position_size:.6f}, 余额={self.current_balance:.2f}")
+                    print(f"空头入场: 日期={entry_date}, 时间={entry_time}, 价格={entry_price:.2f}, 数量={position_size:.6f}, 余额={self.current_balance:.2f}")
                     
                     if trade_count % 50 == 0:
                         print(f"已处理 {trade_count} 笔交易...")
@@ -546,7 +517,20 @@ class NoiseRegionStrategyFixed:
         else:
             sharpe_ratio = 0
         
-        # 保存性能指标
+        # 分析退出原因
+        if 'exit_reason' in trades_df.columns:
+            exit_reason_counts = trades_df['exit_reason'].value_counts()
+            stop_loss_count = exit_reason_counts.get('stop_loss', 0)
+            timeout_count = exit_reason_counts.get('timeout', 0)
+            
+            # 按退出原因计算平均收益
+            avg_pnl_by_reason = trades_df.groupby('exit_reason')['pnl'].mean()
+        else:
+            stop_loss_count = 0
+            timeout_count = 0
+            avg_pnl_by_reason = {}
+        
+                # 保存性能指标
         self.performance = {
             'total_trades': total_trades,
             'winning_trades': winning_trades,
@@ -558,8 +542,17 @@ class NoiseRegionStrategyFixed:
             'sharpe_ratio': sharpe_ratio,
             'initial_balance': self.initial_balance,
             'final_balance': final_balance,
-            'return_pct': return_pct
+            'return_pct': return_pct,
+            'stop_loss_count': stop_loss_count,
+            'timeout_count': timeout_count,
+            'avg_pnl_stop_loss': avg_pnl_by_reason.get('stop_loss', 0),
+            'avg_pnl_timeout': avg_pnl_by_reason.get('timeout', 0)
         }
+        
+        if 'holding_minutes' in trades_df.columns:
+            self.performance['avg_holding_minutes'] = trades_df['holding_minutes'].mean()
+            self.performance['max_holding_minutes'] = trades_df['holding_minutes'].max()
+            self.performance['min_holding_minutes'] = trades_df['holding_minutes'].min()
         
         return self.performance
     
@@ -609,7 +602,7 @@ class NoiseRegionStrategyFixed:
         axs[0].scatter(close_long['timestamp'], close_long['close'], color='blue', marker='x', s=100, label='Close Long')
         axs[0].scatter(close_short['timestamp'], close_short['close'], color='orange', marker='x', s=100, label='Close Short')
         
-        axs[0].set_title(f'Noise Region Strategy - Fixed Interval - {sample_date}')
+        axs[0].set_title(f'Noise Region Strategy - Fixed Time Holding - {sample_date}')
         axs[0].set_ylabel('Price')
         axs[0].legend()
         axs[0].grid(True)
@@ -676,6 +669,29 @@ class NoiseRegionStrategyFixed:
                 
                 plt.legend()
                 plt.savefig(os.path.join(output_dir, 'fixed_balance_history.png'))
+                plt.close()
+            
+            # 绘制退出原因分析
+            if 'exit_reason' in trades_df.columns:
+                exit_reasons = trades_df['exit_reason'].value_counts()
+                
+                plt.figure(figsize=(10, 6))
+                plt.pie(exit_reasons, labels=exit_reasons.index, autopct='%1.1f%%', startangle=90)
+                plt.axis('equal')
+                plt.title('Exit Reason Distribution')
+                plt.savefig(os.path.join(output_dir, 'exit_reason_distribution.png'))
+                plt.close()
+                
+                # 绘制不同退出原因的平均收益
+                avg_pnl_by_reason = trades_df.groupby('exit_reason')['pnl'].mean()
+                
+                plt.figure(figsize=(10, 6))
+                avg_pnl_by_reason.plot(kind='bar')
+                plt.title('Average PnL by Exit Reason')
+                plt.xlabel('Exit Reason')
+                plt.ylabel('Average PnL')
+                plt.grid(True, axis='y')
+                plt.savefig(os.path.join(output_dir, 'avg_pnl_by_exit_reason.png'))
                 plt.close()
     
     def save_results(self, output_dir='./output'):
@@ -782,13 +798,12 @@ def main():
         lookback_days=CONFIG["lookback_days"],
         k1=CONFIG["k1"],
         k2=CONFIG["k2"],
-        trade_start_time=CONFIG["trade_start_time"],
-        trade_end_time=CONFIG["trade_end_time"],
         max_trades_per_day=CONFIG["max_trades_per_day"],
         commission_rate=CONFIG["commission_rate"],
         slippage=CONFIG["slippage"],
         initial_balance=CONFIG["initial_balance"],
-        check_interval=CONFIG["check_interval"]
+        check_interval=CONFIG["check_interval"],
+        max_holding_minutes=CONFIG["max_holding_minutes"]
     )
     
     # 运行回测
@@ -806,4 +821,4 @@ def main():
     strategy.save_results()
 
 if __name__ == "__main__":
-    main()   
+    main()
