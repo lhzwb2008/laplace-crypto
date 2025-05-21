@@ -12,7 +12,7 @@ import time as time_module
 CONFIG = {
     "data_file": None,  # 设置为None会自动查找最新的BTC数据文件
     "source": "okx",
-    "lookback_days": 3,  # 用于计算波动率的历史数据天数
+    "lookback_days": 2,  # 用于计算波动率的历史数据天数
     "k1": 1,  # 上边界乘数
     "k2": 1,  # 下边界乘数
     "max_trades_per_day": 3,  # 每日最大交易次数
@@ -21,13 +21,17 @@ CONFIG = {
     "start_date": "2025-05-10",  # 只处理从这个日期开始的数据
     "initial_balance": 100000,  # 初始资金金额
     "check_interval": 10,  # 检查间隔（分钟），应用于入场、止损和超时检查
-    "max_holding_minutes": 120  # 最大持仓时间（分钟）
+    "max_holding_minutes": 50,  # 最大持仓时间（分钟）
+    "sample_days_count": 5,  # 在回测结果中绘制的样本交易日数量
+    "upper_position": 0.6,  # 价格区间上边界位置(0-1之间)
+    "lower_position": 0.4  # 价格区间下边界位置(0-1之间)
 }
 
 class NoiseRegionStrategyFixed:
     def __init__(self, data, lookback_days=2, k1=1.2, k2=1.2, 
                  max_trades_per_day=3, commission_rate=0.0005, slippage=0.0003,
-                 initial_balance=100000, check_interval=10, max_holding_minutes=120):
+                 initial_balance=100000, check_interval=10, max_holding_minutes=120,
+                 upper_position=0.65, lower_position=0.35):
         """
         噪声区域交易策略初始化 - 固定时间间隔检查版本
         
@@ -42,6 +46,8 @@ class NoiseRegionStrategyFixed:
         initial_balance: float - 初始资金金额
         check_interval: int - 检查间隔（分钟），应用于入场、止损和超时检查
         max_holding_minutes: int - 最大持仓时间（分钟）
+        upper_position: float - 价格区间上边界位置(0-1之间)
+        lower_position: float - 价格区间下边界位置(0-1之间)
         """
         # 数据预处理
         self.data = data.copy()
@@ -57,6 +63,8 @@ class NoiseRegionStrategyFixed:
         self.slippage = slippage
         self.check_interval = check_interval
         self.max_holding_minutes = max_holding_minutes
+        self.upper_position = upper_position
+        self.lower_position = lower_position
         
         # 资金管理
         self.initial_balance = initial_balance
@@ -94,7 +102,7 @@ class NoiseRegionStrategyFixed:
         print(f"已标记 {self.data['is_check_point'].sum()} 个检查点，总数据点 {len(self.data)}")
         
     def calculate_bounds(self):
-        """计算每个时间点的上下边界 - 直接使用昨日价格范围的1/4和3/4价位"""
+        """计算每个时间点的上下边界 - 使用昨日价格范围的自定义位置作为起点，再加减K*sigma"""
         # 为每一行数据添加上下边界
         bounds_data = []
         
@@ -125,21 +133,36 @@ class NoiseRegionStrategyFixed:
             prev_low = prev_day_data['low'].min()
             prev_range = prev_high - prev_low
             
-            # 计算固定的上下边界（1/4和3/4价位）
-            lower_bound = prev_low + prev_range * 0.25  # 1/4价位
-            upper_bound = prev_low + prev_range * 0.75  # 3/4价位
+            # 使用截止到目前的所有历史日期来计算sigma
+            historical_dates = unique_dates[:i]
             
-            # 为当日每个时间点设置相同的边界
+            # 为当日每个时间点设置相应的边界
             for _, row in current_day_data.iterrows():
+                current_time = row['time']
+                
+                # 计算价格区间的上下边界起始点，使用可配置的位置
+                lower_start = prev_low + prev_range * self.lower_position  # 下边界起始点
+                upper_start = prev_low + prev_range * self.upper_position  # 上边界起始点
+                
+                # 计算当前时间点的sigma
+                sigma = self._calculate_sigma(historical_dates, current_time, lower_start)
+                
+                # 使用K*sigma调整上下边界
+                upper_bound = upper_start + self.k1 * sigma * upper_start  # 上边界 = 上边界起始点 + K1*sigma*参考价
+                lower_bound = lower_start - self.k2 * sigma * lower_start  # 下边界 = 下边界起始点 - K2*sigma*参考价
+                
                 # 添加到结果中
                 bounds_row = row.copy()
                 bounds_row['upper_bound'] = upper_bound
                 bounds_row['lower_bound'] = lower_bound
+                bounds_row['upper_start'] = upper_start  # 记录上边界起始点
+                bounds_row['lower_start'] = lower_start  # 记录下边界起始点
+                bounds_row['sigma'] = sigma  # 记录计算的sigma值
                 bounds_row['prev_high'] = prev_high
                 bounds_row['prev_low'] = prev_low
                 bounds_row['prev_range'] = prev_range
-                bounds_row['quarter_position'] = 0.25  # 记录使用了1/4位置
-                bounds_row['three_quarter_position'] = 0.75  # 记录使用了3/4位置
+                bounds_row['lower_position'] = self.lower_position  # 记录使用的位置参数
+                bounds_row['upper_position'] = self.upper_position  # 记录使用的位置参数
                 
                 bounds_data.append(bounds_row)
         
@@ -175,7 +198,7 @@ class NoiseRegionStrategyFixed:
             print(f"调试: 历史日期: {recent_dates}")
             print(f"调试: 当前时间点: {current_time}")
         
-        # 为每个历史日期计算其价格范围的1/4和3/4价位
+        # 为每个历史日期计算其价格范围的下边界位置
         for hist_date_idx, hist_date in enumerate(recent_dates):
             if hist_date_idx == 0:  # 跳过第一天，因为需要前一天的数据
                 continue
@@ -193,8 +216,8 @@ class NoiseRegionStrategyFixed:
             prev_low = prev_hist_day_data['low'].min()
             prev_range = prev_high - prev_low
             
-            # 计算参考价位（1/4和3/4）
-            hist_lower_ref = prev_low + prev_range * 0.25
+            # 计算参考价位（使用自定义的下边界位置）
+            hist_lower_ref = prev_low + prev_range * self.lower_position
             
             # 查找特定时间点的数据
             time_data = hist_day_data[hist_day_data['time'] == current_time]
@@ -556,8 +579,15 @@ class NoiseRegionStrategyFixed:
         
         return self.performance
     
-    def plot_results(self, output_dir='./output', filename='noise_region_fixed_backtest.png'):
-        """绘制回测结果图表"""
+    def plot_results(self, output_dir='./output', filename='noise_region_fixed_backtest.png', sample_days_count=None):
+        """
+        绘制回测结果图表
+        
+        参数:
+        output_dir: str - 输出目录
+        filename: str - 基础文件名（将用于生成多个文件）
+        sample_days_count: int - 要绘制的样本交易日数量，如果为None则使用CONFIG中的配置
+        """
         if self.results is None:
             print("请先运行回测")
             return
@@ -567,65 +597,109 @@ class NoiseRegionStrategyFixed:
         # 创建输出目录
         os.makedirs(output_dir, exist_ok=True)
         
-        # 选择一个交易日的数据进行可视化
+        # 使用CONFIG中的配置或者传入的参数
+        if sample_days_count is None:
+            # 尝试从CONFIG中获取，如果不存在则默认为1
+            sample_days_count = CONFIG.get("sample_days_count", 1)
+            
+        # 选择交易日
         dates = self.results['date'].unique()
-        if len(dates) > 2:  # 选择第三个交易日（前两天是用于计算历史波动率的）
-            sample_date = dates[2]
+        trading_dates = []
+        
+        # 排除前两天（用于计算历史波动率）
+        valid_dates = dates[2:] if len(dates) > 2 else dates
+        
+        # 确保不超过有效日期数量
+        sample_days_count = min(sample_days_count, len(valid_dates))
+        
+        # 选择要绘制的日期
+        if sample_days_count == 1:
+            # 只选择一天，就用第一个有效交易日
+            trading_dates = [valid_dates[0]]
         else:
-            sample_date = dates[-1]
+            # 均匀选择日期
+            indices = np.linspace(0, len(valid_dates)-1, sample_days_count, dtype=int)
+            trading_dates = [valid_dates[i] for i in indices]
         
-        day_data = self.results[self.results['date'] == sample_date].copy()
+        print(f"将绘制 {len(trading_dates)} 个交易日的图表")
         
-        # 创建画布
-        fig, axs = plt.subplots(3, 1, figsize=(15, 12), gridspec_kw={'height_ratios': [3, 1, 1]})
-        
-        # 绘制价格和边界
-        axs[0].plot(day_data['timestamp'], day_data['close'], label='Close Price', color='black')
-        axs[0].plot(day_data['timestamp'], day_data['upper_bound'], label='Upper Bound', color='red', linestyle='--')
-        axs[0].plot(day_data['timestamp'], day_data['lower_bound'], label='Lower Bound', color='green', linestyle='--')
-        
-        if 'stop_loss' in day_data.columns:
-            axs[0].plot(day_data['timestamp'], day_data['stop_loss'], label='Stop Loss', color='purple', linestyle=':')
-        
-        # 标记检查点
-        check_points = day_data[day_data['is_check_point']]
-        axs[0].scatter(check_points['timestamp'], check_points['close'], color='yellow', marker='o', s=30, label='Check Point')
-        
-        # 标记交易信号
-        buy_signals = day_data[day_data['signal'] == 1]
-        sell_signals = day_data[day_data['signal'] == -1]
-        close_long = day_data[day_data['signal'] == 2]
-        close_short = day_data[day_data['signal'] == -2]
-        
-        axs[0].scatter(buy_signals['timestamp'], buy_signals['close'], color='green', marker='^', s=100, label='Buy')
-        axs[0].scatter(sell_signals['timestamp'], sell_signals['close'], color='red', marker='v', s=100, label='Sell')
-        axs[0].scatter(close_long['timestamp'], close_long['close'], color='blue', marker='x', s=100, label='Close Long')
-        axs[0].scatter(close_short['timestamp'], close_short['close'], color='orange', marker='x', s=100, label='Close Short')
-        
-        axs[0].set_title(f'Noise Region Strategy - Fixed Time Holding - {sample_date}')
-        axs[0].set_ylabel('Price')
-        axs[0].legend()
-        axs[0].grid(True)
-        
-        # 绘制持仓状态
-        axs[1].plot(day_data['timestamp'], day_data['position'], label='Position', color='blue', drawstyle='steps-post')
-        axs[1].set_ylabel('Position')
-        axs[1].set_yticks([-1, 0, 1])
-        axs[1].set_yticklabels(['Short', 'Flat', 'Long'])
-        axs[1].grid(True)
-        
-        # 绘制检查点标记
-        axs[2].step(day_data['timestamp'], day_data['is_check_point'].astype(int), where='post', color='orange', label='Check Points')
-        axs[2].set_xlabel('Time')
-        axs[2].set_ylabel('Check Point')
-        axs[2].set_yticks([0, 1])
-        axs[2].set_yticklabels(['No', 'Yes'])
-        axs[2].grid(True)
-        
-        plt.tight_layout()
-        plt.savefig(os.path.join(output_dir, filename))
-        plt.close()
-        
+        # 为每个交易日绘制图表
+        for i, sample_date in enumerate(trading_dates):
+            day_data = self.results[self.results['date'] == sample_date].copy()
+            
+            if len(day_data) == 0:
+                print(f"警告: 日期 {sample_date} 没有数据，跳过")
+                continue
+                
+            print(f"绘制交易日 {sample_date} 图表 ({i+1}/{len(trading_dates)})")
+            
+            # 创建画布
+            fig, axs = plt.subplots(3, 1, figsize=(15, 12), gridspec_kw={'height_ratios': [3, 1, 1]})
+            
+            # 绘制价格和边界
+            axs[0].plot(day_data['timestamp'], day_data['close'], label='Close Price', color='black')
+            axs[0].plot(day_data['timestamp'], day_data['upper_bound'], label='Upper Bound', color='red', linestyle='--')
+            axs[0].plot(day_data['timestamp'], day_data['lower_bound'], label='Lower Bound', color='green', linestyle='--')
+            
+            # 绘制起始点（上下边界的基准点）
+            if 'upper_start' in day_data.columns and 'lower_start' in day_data.columns:
+                upper_pos = day_data['upper_position'].iloc[0] * 100 if 'upper_position' in day_data.columns else 65
+                lower_pos = day_data['lower_position'].iloc[0] * 100 if 'lower_position' in day_data.columns else 35
+                
+                axs[0].plot(day_data['timestamp'], day_data['upper_start'], 
+                          label=f'Upper Start ({upper_pos:.0f}%)', color='orange', linestyle=':')
+                axs[0].plot(day_data['timestamp'], day_data['lower_start'], 
+                          label=f'Lower Start ({lower_pos:.0f}%)', color='blue', linestyle=':')
+            
+            if 'stop_loss' in day_data.columns:
+                # 过滤掉NaN值
+                stop_loss_data = day_data.dropna(subset=['stop_loss'])
+                if len(stop_loss_data) > 0:
+                    axs[0].plot(stop_loss_data['timestamp'], stop_loss_data['stop_loss'], label='Stop Loss', color='purple', linestyle=':')
+            
+            # 标记检查点
+            check_points = day_data[day_data['is_check_point']]
+            axs[0].scatter(check_points['timestamp'], check_points['close'], color='yellow', marker='o', s=30, label='Check Point')
+            
+            # 标记交易信号
+            buy_signals = day_data[day_data['signal'] == 1]
+            sell_signals = day_data[day_data['signal'] == -1]
+            close_long = day_data[day_data['signal'] == 2]
+            close_short = day_data[day_data['signal'] == -2]
+            
+            axs[0].scatter(buy_signals['timestamp'], buy_signals['close'], color='green', marker='^', s=100, label='Buy')
+            axs[0].scatter(sell_signals['timestamp'], sell_signals['close'], color='red', marker='v', s=100, label='Sell')
+            axs[0].scatter(close_long['timestamp'], close_long['close'], color='blue', marker='x', s=100, label='Close Long')
+            axs[0].scatter(close_short['timestamp'], close_short['close'], color='orange', marker='x', s=100, label='Close Short')
+            
+            axs[0].set_title(f'Noise Region Strategy - Fixed Time Holding - {sample_date}')
+            axs[0].set_ylabel('Price')
+            axs[0].legend()
+            axs[0].grid(True)
+            
+            # 绘制持仓状态
+            axs[1].plot(day_data['timestamp'], day_data['position'], label='Position', color='blue', drawstyle='steps-post')
+            axs[1].set_ylabel('Position')
+            axs[1].set_yticks([-1, 0, 1])
+            axs[1].set_yticklabels(['Short', 'Flat', 'Long'])
+            axs[1].grid(True)
+            
+            # 绘制检查点标记
+            axs[2].step(day_data['timestamp'], day_data['is_check_point'].astype(int), where='post', color='orange', label='Check Points')
+            axs[2].set_xlabel('Time')
+            axs[2].set_ylabel('Check Point')
+            axs[2].set_yticks([0, 1])
+            axs[2].set_yticklabels(['No', 'Yes'])
+            axs[2].grid(True)
+            
+            plt.tight_layout()
+            
+            # 生成带有日期的文件名
+            date_str = sample_date.strftime('%Y%m%d') if hasattr(sample_date, 'strftime') else sample_date
+            day_filename = f"{os.path.splitext(filename)[0]}_{date_str}{os.path.splitext(filename)[1]}"
+            plt.savefig(os.path.join(output_dir, day_filename))
+            plt.close()
+            
         # 绘制整体盈亏曲线
         if self.trades:
             trades_df = pd.DataFrame(self.trades)
@@ -803,7 +877,9 @@ def main():
         slippage=CONFIG["slippage"],
         initial_balance=CONFIG["initial_balance"],
         check_interval=CONFIG["check_interval"],
-        max_holding_minutes=CONFIG["max_holding_minutes"]
+        max_holding_minutes=CONFIG["max_holding_minutes"],
+        upper_position=CONFIG["upper_position"],
+        lower_position=CONFIG["lower_position"]
     )
     
     # 运行回测
@@ -814,8 +890,10 @@ def main():
     for key, value in performance.items():
         print(f"{key}: {value}")
     
-    # 绘制回测结果
-    strategy.plot_results()
+    # 绘制回测结果，使用配置中的样本日数量
+    sample_days_count = CONFIG.get("sample_days_count", 1)
+    print(f"将绘制 {sample_days_count} 个交易日的样本图表")
+    strategy.plot_results(sample_days_count=sample_days_count)
     
     # 保存结果
     strategy.save_results()
